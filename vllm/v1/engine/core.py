@@ -77,6 +77,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.kv_debug import kv_debug_log, kv_spec_summary
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -241,6 +242,12 @@ class EngineCore:
 
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
+        kv_debug_log(
+            logger,
+            "EngineCore._initialize_kv_caches: kv_cache_specs=%s",
+            [[kv_spec_summary(spec) for spec in worker_specs]
+             for worker_specs in kv_cache_specs],
+        )
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
@@ -260,6 +267,12 @@ class EngineCore:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
 
+        kv_debug_log(
+            logger,
+            "EngineCore._initialize_kv_caches: available_gpu_memory=%s",
+            available_gpu_memory,
+        )
+
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
         # Track max_model_len before KV cache config to detect auto-fit changes
@@ -267,6 +280,18 @@ class EngineCore:
 
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
+        )
+        kv_debug_log(
+            logger,
+            "EngineCore._initialize_kv_caches: worker_kv_cache_configs=%s",
+            [
+                {
+                    "num_blocks": cfg.num_blocks,
+                    "num_groups": len(cfg.kv_cache_groups),
+                    "num_tensors": len(cfg.kv_cache_tensors),
+                }
+                for cfg in kv_cache_configs
+            ],
         )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
@@ -277,6 +302,20 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        kv_debug_log(
+            logger,
+            "EngineCore._initialize_kv_caches: scheduler_num_blocks=%s "
+            "scheduler_groups=%s",
+            scheduler_kv_cache_config.num_blocks,
+            [
+                {
+                    "group_id": idx,
+                    "layers": group.layer_names,
+                    "spec": kv_spec_summary(group.kv_cache_spec),
+                }
+                for idx, group in enumerate(scheduler_kv_cache_config.kv_cache_groups)
+            ],
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:

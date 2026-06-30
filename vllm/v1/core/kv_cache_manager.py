@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.kv_debug import kv_block_ids_summary, kv_debug_log
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -171,6 +172,18 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+        kv_debug_log(
+            logger,
+            "KVCacheManager.__init__: max_model_len=%s "
+            "scheduler_block_size=%s hash_block_size=%s "
+            "num_groups=%s num_blocks=%s enable_caching=%s",
+            self.max_model_len,
+            scheduler_block_size,
+            hash_block_size,
+            self.num_kv_cache_groups,
+            kv_cache_config.num_blocks,
+            self.enable_caching,
+        )
 
     @property
     def usage(self) -> float:
@@ -232,6 +245,18 @@ class KVCacheManager:
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
             )
+
+        kv_debug_log(
+            logger,
+            "KVCacheManager.get_computed_blocks: req_id=%s "
+            "prompt_tokens=%s max_cache_hit_length=%s hit_tokens=%s "
+            "hit_blocks=%s",
+            request.request_id,
+            request.num_tokens,
+            max_cache_hit_length,
+            num_new_computed_tokens,
+            kv_block_ids_summary(self.create_kv_cache_blocks(computed_blocks)),
+        )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
@@ -350,6 +375,25 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        kv_debug_log(
+            logger,
+            "KVCacheManager.allocate_slots:start req_id=%s "
+            "req_num_tokens=%s req_num_computed=%s num_new_tokens=%s "
+            "num_new_computed=%s num_external_computed=%s lookahead=%s "
+            "reserved_blocks=%s full_sequence_must_fit=%s free_blocks=%s "
+            "new_computed_blocks=%s",
+            request.request_id,
+            request.num_tokens,
+            request.num_computed_tokens,
+            num_new_tokens,
+            num_new_computed_tokens,
+            num_external_computed_tokens,
+            num_lookahead_tokens,
+            reserved_blocks,
+            full_sequence_must_fit,
+            self.block_pool.get_num_free_blocks(),
+            kv_block_ids_summary(new_computed_blocks),
+        )
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -365,6 +409,14 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+                kv_debug_log(
+                    logger,
+                    "KVCacheManager.allocate_slots:full-fit-fail req_id=%s "
+                    "need_blocks=%s free_blocks=%s",
+                    request.request_id,
+                    num_blocks_to_allocate,
+                    self.block_pool.get_num_free_blocks(),
+                )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -395,6 +447,18 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         if num_blocks_to_allocate > available_blocks:
             # Cannot allocate new blocks
+            kv_debug_log(
+                logger,
+                "KVCacheManager.allocate_slots:fail req_id=%s need_blocks=%s "
+                "available_blocks=%s raw_free_blocks=%s reserved_blocks=%s "
+                "num_tokens_need_slot=%s",
+                request.request_id,
+                num_blocks_to_allocate,
+                available_blocks,
+                self.block_pool.get_num_free_blocks(),
+                reserved_blocks,
+                num_tokens_need_slot,
+            )
             return None
 
         if (
@@ -416,6 +480,19 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        kv_debug_log(
+            logger,
+            "KVCacheManager.allocate_slots:allocated req_id=%s need_blocks=%s "
+            "new_blocks=%s num_tokens_need_slot=%s num_tokens_main_model=%s "
+            "free_blocks_after_alloc=%s delay_cache_blocks=%s",
+            request.request_id,
+            num_blocks_to_allocate,
+            kv_block_ids_summary(self.create_kv_cache_blocks(new_blocks)),
+            num_tokens_need_slot,
+            num_tokens_main_model,
+            self.block_pool.get_num_free_blocks(),
+            delay_cache_blocks,
+        )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -432,6 +509,14 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        kv_debug_log(
+            logger,
+            "KVCacheManager.allocate_slots:cached req_id=%s "
+            "num_tokens_to_cache=%s total_computed_tokens=%s",
+            request.request_id,
+            num_tokens_to_cache,
+            total_computed_tokens,
+        )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -443,6 +528,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        kv_debug_log(logger, "KVCacheManager.free: req_id=%s", request.request_id)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(

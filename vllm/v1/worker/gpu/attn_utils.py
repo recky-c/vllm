@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -21,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_debug import kv_debug_log, kv_spec_summary, kv_tensor_summary
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -28,6 +30,8 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
     prepare_kernel_block_sizes,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,14 @@ def _allocate_kv_cache(
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        kv_debug_log(
+            logger,
+            "attn_utils._allocate_kv_cache: raw_tensor shared_by=%s "
+            "size=%s tensor=%s",
+            kv_cache_tensor.shared_by,
+            kv_cache_tensor.size,
+            kv_tensor_summary(tensor),
+        )
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
@@ -196,6 +208,16 @@ def _reshape_kv_cache(
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
             num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            kv_debug_log(
+                logger,
+                "attn_utils._reshape_kv_cache:start layer=%s group=%s "
+                "num_blocks=%s spec=%s raw=%s",
+                layer_name,
+                group.kv_cache_group_id,
+                num_blocks,
+                kv_spec_summary(kv_cache_spec),
+                kv_tensor_summary(kv_raw_tensor),
+            )
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -250,6 +272,15 @@ def _reshape_kv_cache(
                     # No padding — safe to use a contiguous view.
                     kv_cache = kv_tensor.view(kv_cache_shape)
                 kv_caches[layer_name] = kv_cache.permute(*inv_order)
+                kv_debug_log(
+                    logger,
+                    "attn_utils._reshape_kv_cache:attention layer=%s "
+                    "kernel_block_size=%s kernel_num_blocks=%s cache=%s",
+                    layer_name,
+                    kernel_block_size,
+                    kernel_num_blocks,
+                    kv_tensor_summary(kv_caches[layer_name]),
+                )
 
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
@@ -271,6 +302,12 @@ def _reshape_kv_cache(
                     state_tensors.append(tensor)
                     storage_offset_bytes += stride[0] * dtype_size
                 kv_caches[layer_name] = state_tensors
+                kv_debug_log(
+                    logger,
+                    "attn_utils._reshape_kv_cache:mamba layer=%s state_tensors=%s",
+                    layer_name,
+                    [kv_tensor_summary(t) for t in state_tensors],
+                )
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"

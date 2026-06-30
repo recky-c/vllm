@@ -153,6 +153,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_debug import kv_debug_log, kv_tensor_summary
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -1151,6 +1152,11 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
+            kv_debug_log(
+                logger,
+                "GPUModelRunner._update_states: zero_new_blocks=%s",
+                scheduler_output.new_block_ids_to_zero,
+            )
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
@@ -1232,6 +1238,17 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+            )
+            kv_debug_log(
+                logger,
+                "GPUModelRunner._update_states:new_req req_id=%s "
+                "prompt_tokens=%s num_computed_tokens=%s block_ids=%s",
+                req_id,
+                len(new_req_data.prompt_token_ids)
+                if new_req_data.prompt_token_ids is not None
+                else None,
+                new_req_data.num_computed_tokens,
+                new_req_data.block_ids,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1371,12 +1388,27 @@ class GPUModelRunner(
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
+                    kv_debug_log(
+                        logger,
+                        "GPUModelRunner._update_states:append_blocks req_id=%s "
+                        "new_block_ids=%s all_block_ids=%s",
+                        req_id,
+                        new_block_ids,
+                        req_state.block_ids,
+                    )
             else:
                 assert req_index is None
                 assert new_block_ids is not None
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                kv_debug_log(
+                    logger,
+                    "GPUModelRunner._update_states:resume_blocks req_id=%s "
+                    "block_ids=%s",
+                    req_id,
+                    req_state.block_ids,
+                )
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -1399,6 +1431,14 @@ class GPUModelRunner(
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+                kv_debug_log(
+                    logger,
+                    "GPUModelRunner._update_states:block_table_append req_id=%s "
+                    "req_index=%s new_block_ids=%s",
+                    req_id,
+                    req_index,
+                    new_block_ids,
+                )
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -2250,6 +2290,18 @@ class GPUModelRunner(
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
+        kv_debug_log(
+            logger,
+            "GPUModelRunner._prepare_attn_metadata: num_reqs=%s "
+            "num_tokens=%s num_reqs_padded=%s num_tokens_padded=%s "
+            "block_table_gid0=%s slot_mapping_gid0=%s",
+            num_reqs,
+            num_tokens,
+            num_reqs_padded,
+            num_tokens_padded,
+            kv_tensor_summary(block_table_gid_0),
+            kv_tensor_summary(slot_mapping_gid_0),
+        )
 
         if self.routed_experts_initialized:
             # Copy this step's attention slot_mapping into our private
@@ -3974,6 +4026,18 @@ class GPUModelRunner(
             gid: _get_slot_mapping(gid)
             for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
         }
+        kv_debug_log(
+            logger,
+            "GPUModelRunner._build_slot_mappings: num_tokens_unpadded=%s "
+            "num_tokens_padded=%s num_reqs_padded=%s slot_mappings=%s",
+            num_tokens_unpadded,
+            num_tokens_padded,
+            num_reqs_padded,
+            {
+                gid: kv_tensor_summary(slot_mapping)
+                for gid, slot_mapping in slot_mappings_by_gid.items()
+            },
+        )
 
         slot_mappings_by_layer: dict[str, torch.Tensor] = {}
         for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):

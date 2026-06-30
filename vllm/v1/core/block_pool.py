@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.kv_debug import kv_block_ids_summary, kv_debug_log
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -180,6 +181,16 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        kv_debug_log(
+            logger,
+            "BlockPool.__init__: num_gpu_blocks=%s enable_caching=%s "
+            "hash_block_size=%s null_block_id=%s free_blocks=%s",
+            self.num_gpu_blocks,
+            self.enable_caching,
+            self.hash_block_size,
+            self.null_block.block_id,
+            self.get_num_free_blocks(),
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -245,6 +256,17 @@ class BlockPool:
         if num_cached_blocks >= num_full_blocks:
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+        kv_debug_log(
+            logger,
+            "BlockPool.cache_full_blocks:start req_id=%s group=%s "
+            "num_cached_blocks=%s num_full_blocks=%s block_size=%s blocks=%s",
+            request.request_id,
+            kv_cache_group_id,
+            num_cached_blocks,
+            num_full_blocks,
+            block_size,
+            kv_block_ids_summary(new_full_blocks),
+        )
         assert len(request.block_hashes) >= num_full_blocks
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
         if block_size == self.hash_block_size:
@@ -360,6 +382,14 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        kv_debug_log(
+            logger,
+            "BlockPool.get_new_blocks: requested=%s allocated=%s "
+            "free_blocks_after=%s",
+            num_blocks,
+            kv_block_ids_summary(ret),
+            self.get_num_free_blocks(),
+        )
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -388,6 +418,11 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        kv_debug_log(
+            logger,
+            "BlockPool._maybe_evict_cached_block: evicted block_id=%s",
+            block.block_id,
+        )
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -415,6 +450,12 @@ class BlockPool:
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+        kv_debug_log(
+            logger,
+            "BlockPool.touch: blocks=%s free_blocks_after=%s",
+            kv_block_ids_summary(blocks),
+            self.get_num_free_blocks(),
+        )
 
     def free_blocks(
         self, ordered_blocks: Iterable[KVCacheBlock], prepend: bool = False
@@ -439,6 +480,15 @@ class BlockPool:
             self.free_block_queue.prepend_n(freed_blocks)
         else:
             self.free_block_queue.append_n(freed_blocks)
+        kv_debug_log(
+            logger,
+            "BlockPool.free_blocks: input=%s freed=%s prepend=%s "
+            "free_blocks_after=%s",
+            kv_block_ids_summary(blocks_list),
+            kv_block_ids_summary(freed_blocks),
+            prepend,
+            self.get_num_free_blocks(),
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

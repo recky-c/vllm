@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_debug import kv_block_ids_summary, kv_debug_log
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -372,6 +373,17 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        kv_debug_log(
+            logger,
+            "Scheduler.schedule:start step=%s running=%s waiting=%s "
+            "skipped_waiting=%s token_budget=%s kv_usage=%.4f",
+            self.current_step,
+            len(self.running),
+            len(self.waiting),
+            len(self.skipped_waiting),
+            token_budget,
+            self.kv_cache_manager.usage,
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -514,6 +526,17 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            kv_debug_log(
+                logger,
+                "Scheduler.schedule:running req_id=%s num_new_tokens=%s "
+                "new_blocks=%s token_budget_after=%s computed=%s tokens=%s",
+                request_id,
+                num_new_tokens,
+                kv_block_ids_summary(new_blocks),
+                token_budget,
+                request.num_computed_tokens,
+                request.num_tokens,
+            )
             req_index += 1
 
             # Speculative decode related.
@@ -842,6 +865,20 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                kv_debug_log(
+                    logger,
+                    "Scheduler.schedule:waiting req_id=%s status=%s "
+                    "num_new_tokens=%s blocks=%s token_budget_after=%s "
+                    "prefix_hit_tokens=%s external_hit_tokens=%s load_kv_async=%s",
+                    request_id,
+                    request.status,
+                    num_new_tokens,
+                    kv_block_ids_summary(req_to_new_blocks[request_id]),
+                    token_budget,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                    load_kv_async,
+                )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Only track requests that will still be prefilling after this chunk.
@@ -962,6 +999,21 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        kv_debug_log(
+            logger,
+            "Scheduler.schedule:output step=%s scheduled=%s total_tokens=%s "
+            "new_reqs=%s cached_reqs=%s preempted=%s "
+            "num_common_prefix_blocks=%s new_block_ids_to_zero=%s kv_usage=%.4f",
+            self.current_step,
+            num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            [req.req_id for req in scheduler_output.scheduled_new_reqs],
+            list(scheduler_output.scheduled_cached_reqs.req_ids),
+            scheduler_output.preempted_req_ids,
+            num_common_prefix_blocks,
+            new_block_ids_to_zero,
+            self.kv_cache_manager.usage,
+        )
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -988,6 +1040,12 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        kv_debug_log(
+            logger,
+            "Scheduler._preempt_request: req_id=%s num_preemptions=%s",
+            request.request_id,
+            request.num_preemptions,
+        )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
