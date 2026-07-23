@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -416,7 +417,151 @@ class Scheduler(SchedulerInterface):
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
-        return max(end - start, 0)
+        clipped = max(end - start, 0)
+        if self._sched_debug_enabled() and clipped != num_new_tokens:
+            logger.info(
+                "[HYBRID-SCHED][align] req=%s clip num_new_tokens %d -> %d "
+                "(start=%d end_raw=%d last_cache_pos=%d "
+                "shared_prefix_boundary=%s) "
+                "need_mamba_block_aligned_split=%s",
+                request.request_id,
+                num_new_tokens,
+                clipped,
+                start,
+                start + num_new_tokens,
+                last_cache_position,
+                getattr(request, "shared_prefix_boundary", 0),
+                self.need_mamba_block_aligned_split,
+            )
+        return clipped
+
+    def _sched_debug_enabled(self) -> bool:
+        """Learning logs for schedule().
+
+        - VLLM_HYBRID_SCHED_DEBUG=1: always on
+        - VLLM_HYBRID_SCHED_DEBUG=0: always off
+        - unset: on when hybrid/mamba (has_mamba or multi kv groups)
+        """
+        env = os.environ.get("VLLM_HYBRID_SCHED_DEBUG")
+        if env is not None:
+            return env == "1"
+        return bool(
+            getattr(self, "has_mamba_layers", False)
+            or self.kv_cache_manager.num_kv_cache_groups > 1
+        )
+
+    def _format_kv_blocks(self, blocks: "KVCacheBlocks | None") -> str:
+        if blocks is None:
+            return "None"
+        parts: list[str] = []
+        for gid, group_blocks in enumerate(blocks.blocks):
+            n = len(group_blocks)
+            sample_ids = [b.block_id for b in group_blocks[:2]]
+            if n > 2:
+                sample_ids.append(group_blocks[-1].block_id)
+            parts.append(f"g{gid}:n={n},ids={sample_ids}")
+        return "{" + "; ".join(parts) + "}"
+
+    def _log_sched_begin(self, token_budget: int, defer_prefills: bool) -> None:
+        if not self._sched_debug_enabled():
+            return
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        logger.info(
+            "[SCHED][begin] step=%d running=%d waiting=%d "
+            "token_budget=%d free_blocks=%d num_kv_groups=%d "
+            "has_mamba=%s need_align_split=%s mamba_cache_mode=%s "
+            "prefix_caching=%s defer_prefills=%s",
+            self.current_step,
+            len(self.running),
+            len(self.waiting) + len(self.skipped_waiting),
+            token_budget,
+            free,
+            self.kv_cache_manager.num_kv_cache_groups,
+            self.has_mamba_layers,
+            self.need_mamba_block_aligned_split,
+            self.cache_config.mamba_cache_mode,
+            self.cache_config.enable_prefix_caching,
+            defer_prefills,
+        )
+
+    def _log_sched_alloc(
+        self,
+        phase: str,
+        request: Request,
+        num_new_tokens: int,
+        new_blocks: "KVCacheBlocks | None",
+        *,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+        shared_prefix_boundary: int = 0,
+    ) -> None:
+        if not self._sched_debug_enabled():
+            return
+        tag = "[HYBRID-SCHED]" if (
+            self.has_mamba_layers or self.kv_cache_manager.num_kv_cache_groups > 1
+        ) else "[SCHED]"
+        logger.info(
+            "%s[alloc] phase=%s req=%s status=%s "
+            "num_new_tokens=%d local_hit=%d ext_hit=%d "
+            "computed=%d prompt=%d shared_prefix_boundary=%d "
+            "new_blocks=%s ok=%s",
+            tag,
+            phase,
+            request.request_id,
+            request.status.name if hasattr(request.status, "name") else request.status,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+            request.num_computed_tokens,
+            request.num_prompt_tokens,
+            shared_prefix_boundary,
+            self._format_kv_blocks(new_blocks),
+            new_blocks is not None,
+        )
+
+    def _log_sched_end(
+        self,
+        scheduler_output: "SchedulerOutput",
+        scheduled_running_reqs: list,
+        scheduled_new_reqs: list,
+        scheduled_resumed_reqs: list,
+        preempted_reqs: list,
+        num_common_prefix_blocks: list[int],
+    ) -> None:
+        if not self._sched_debug_enabled():
+            return
+        # Sample up to 3 requests' scheduled token counts / block shapes.
+        samples = []
+        for req_id, ntok in list(scheduler_output.num_scheduled_tokens.items())[:3]:
+            samples.append(f"{req_id}:{ntok}tok")
+        hybrid = (
+            self.has_mamba_layers or self.kv_cache_manager.num_kv_cache_groups > 1
+        )
+        tag = "[HYBRID-SCHED]" if hybrid else "[SCHED]"
+        logger.info(
+            "%s[end] step=%d total_tokens=%d "
+            "running_sched=%d new_sched=%d resumed_sched=%d preempted=%d "
+            "num_common_prefix_blocks=%s sample=%s "
+            "(block_ids are tuple[list] per kv_cache_group when hybrid)",
+            tag,
+            self.current_step,
+            scheduler_output.total_num_scheduled_tokens,
+            len(scheduled_running_reqs),
+            len(scheduled_new_reqs),
+            len(scheduled_resumed_reqs),
+            len(preempted_reqs),
+            num_common_prefix_blocks,
+            samples,
+        )
+        if hybrid and scheduler_output.scheduled_new_reqs:
+            for nr in scheduler_output.scheduled_new_reqs[:2]:
+                logger.info(
+                    "[HYBRID-SCHED][end] new_req=%s block_ids_groups=%d "
+                    "group_lens=%s",
+                    nr.req_id,
+                    len(nr.block_ids),
+                    [len(g) for g in nr.block_ids],
+                )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -461,6 +606,8 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
+
+        self._log_sched_begin(token_budget, defer_prefills)
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -614,6 +761,12 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            self._log_sched_alloc(
+                "running",
+                request,
+                num_new_tokens,
+                new_blocks,
+            )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -739,6 +892,17 @@ class Scheduler(SchedulerInterface):
                         # The per-group lookup does not detect an uncached shared
                         # prefix, so there is no junction to pin in this path.
                         request.shared_prefix_boundary = 0
+                        if self._sched_debug_enabled():
+                            logger.info(
+                                "[HYBRID-SCHED][prefix] PD+mamba per-group hit: "
+                                "req=%s per_group_hits=%s "
+                                "num_new_local_computed_tokens=%d "
+                                "(FA hit used so D-side mamba miss "
+                                "does not zero FA hit)",
+                                request.request_id,
+                                per_group_hits,
+                                num_new_local_computed_tokens,
+                            )
                         if self.kv_cache_manager.log_stats:
                             assert self.kv_cache_manager.prefix_cache_stats is not None
                             self.kv_cache_manager.prefix_cache_stats.record(
@@ -756,6 +920,21 @@ class Scheduler(SchedulerInterface):
                             # if no uncached shared prefix was detected.
                             request.shared_prefix_boundary,
                         ) = self.kv_cache_manager.get_computed_blocks(request)
+                        if self._sched_debug_enabled() and (
+                            self.has_mamba_layers
+                            or self.kv_cache_manager.num_kv_cache_groups > 1
+                            or num_new_local_computed_tokens > 0
+                        ):
+                            logger.info(
+                                "[HYBRID-SCHED][prefix] get_computed_blocks: "
+                                "req=%s local_hit=%d shared_prefix_boundary=%d "
+                                "blocks=%s num_groups=%d",
+                                request.request_id,
+                                num_new_local_computed_tokens,
+                                request.shared_prefix_boundary,
+                                self._format_kv_blocks(new_computed_blocks),
+                                self.kv_cache_manager.num_kv_cache_groups,
+                            )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -891,6 +1070,7 @@ class Scheduler(SchedulerInterface):
 
                 # Skip block alignment when setting up async receive (no local work).
                 if self.need_mamba_block_aligned_split and not load_kv_async:
+                    before_align = num_new_tokens
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -898,6 +1078,14 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        if self._sched_debug_enabled():
+                            logger.info(
+                                "[HYBRID-SCHED][align] waiting req=%s "
+                                "skipped: align clipped %d -> 0 "
+                                "(insufficient budget for next block boundary)",
+                                request.request_id,
+                                before_align,
+                            )
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1023,6 +1211,22 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                phase = (
+                    "waiting_new"
+                    if request in scheduled_new_reqs
+                    else "waiting_resume"
+                )
+                self._log_sched_alloc(
+                    phase,
+                    request,
+                    num_new_tokens,
+                    req_to_new_blocks[request_id],
+                    num_new_local_computed_tokens=num_new_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                    shared_prefix_boundary=getattr(
+                        request, "shared_prefix_boundary", 0
+                    ),
+                )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1184,6 +1388,14 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._log_sched_end(
+            scheduler_output,
+            scheduled_running_reqs,
+            scheduled_new_reqs,
+            scheduled_resumed_reqs,
+            preempted_reqs,
+            num_common_prefix_blocks,
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(
