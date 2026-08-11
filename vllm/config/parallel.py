@@ -341,6 +341,16 @@ class ParallelConfig:
     not change by dcp, it simply reuse the GPUs of TP group, and tp_size
     needs to be divisible by dcp_size."""
 
+    kvpp_size: int = Field(default=1, ge=1)
+    """Number of ranks that partition KV cache ownership by layer.
+
+    KVPP does not expand the process world size. It reuses the same TP
+    rank layout, but each rank only owns a contiguous segment of transformer
+    layers' persistent KV; non-owned layers use scratch cache refilled per
+    batch by the platform runtime. The allocation strategy itself is owned
+    by the platform plugin via a registered KV cache allocation hook.
+    """
+
     dcp_kv_cache_interleave_size: int = 1
     """
     Interleave size of kv_cache storage while using DCP.
@@ -510,6 +520,19 @@ class ParallelConfig:
             raise ValueError(
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
+
+        kvpp = self.kvpp_size
+        if kvpp > 1:
+            if self.decode_context_parallel_size > 1:
+                raise ValueError(
+                    "decode_context_parallel_size and kvpp_size cannot both "
+                    "be greater than 1."
+                )
+            if self.tensor_parallel_size % kvpp != 0:
+                raise ValueError(
+                    f"tp_size={self.tensor_parallel_size} must be divisible by "
+                    f"kvpp_size={kvpp}."
+                )
 
         return self
 

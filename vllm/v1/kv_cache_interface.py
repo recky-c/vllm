@@ -934,6 +934,19 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    kvpp_rank: int = 0
+    """Rank in the KV layer-parallel group for this worker.
+
+    Populated only when the platform plugin registers a KV cache allocation
+    hook that partitions layer ownership. Stays 0 for the default path.
+    """
+    kvpp_layer_owners: dict[str, int] | None = None
+    """Mapping from logical KV cache layer names to their owner KVPP rank.
+
+    Written by the platform allocation hook and consumed by the platform model
+    runner to build its layer-parallel transport. ``None`` means KVPP is not
+    active for this worker.
+    """
 
     @property
     def has_mamba_layers(self) -> bool:

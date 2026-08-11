@@ -2002,6 +2002,71 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+# ---------------------------------------------------------------------------
+# Platform KV cache allocation hook
+#
+# A platform plugin may register a callable to override how each worker's KV
+# cache allocation is projected from the global cache groups.  The default
+# path (no hook) uses ``_project_kv_cache_groups_to_worker`` and treats every
+# layer as persistent on every worker.  A hook is how features such as KV
+# layer parallelism (KVPP) — where each rank owns only a contiguous segment of
+# layers and uses scratch buffers for the rest — customise allocation without
+# patching this file.
+#
+# The hook returns, per worker:
+#   * ``allocation_groups`` — the projected groups used for auto-fit/memory
+#     checks and for building the ``KVCacheConfig``.
+#   * ``scratch_aliases`` — optional mapping from a scratch layer name to the
+#     logical layer names that alias it (expanded into ``KVCacheTensor.shared_by``).
+#   * ``kvpp_layer_owners`` — optional mapping written into
+#     ``KVCacheConfig.kvpp_layer_owners``; ``None`` when KVPP is inactive.
+# ---------------------------------------------------------------------------
+
+KVCacheAllocationHook = Callable[
+    [
+        VllmConfig,
+        list[KVCacheGroupSpec],
+        dict[str, KVCacheSpec],
+        int,
+    ],
+    "KVCacheAllocationResult",
+]
+
+
+@dataclass
+class KVCacheAllocationResult:
+    """Per-worker allocation override returned by a platform allocation hook."""
+
+    allocation_groups: list[KVCacheGroupSpec]
+    scratch_aliases: dict[str, list[str]] | None = None
+    kvpp_layer_owners: dict[str, int] | None = None
+
+
+_kv_cache_allocation_hook: KVCacheAllocationHook | None = None
+
+
+def register_kv_cache_allocation_hook(hook: KVCacheAllocationHook) -> None:
+    """Register a platform-specific KV cache allocation override.
+
+    Only one hook may be active at a time.  A plugin calls this during platform
+    initialisation when its parallel config requests custom allocation (e.g.
+    ``kvpp_size > 1``).  The hook is invoked once per worker inside
+    :func:`get_kv_cache_configs`.
+    """
+    global _kv_cache_allocation_hook
+    if _kv_cache_allocation_hook is not None and _kv_cache_allocation_hook is not hook:
+        raise RuntimeError(
+            "A KV cache allocation hook is already registered. Only one "
+            "platform allocation override may be active at a time."
+        )
+    _kv_cache_allocation_hook = hook
+
+
+def get_kv_cache_allocation_hook() -> KVCacheAllocationHook | None:
+    """Return the currently registered allocation hook, if any."""
+    return _kv_cache_allocation_hook
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2061,11 +2126,27 @@ def get_kv_cache_configs(
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
-    # We use per-worker projected groups to account for PP sharding.
-    projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
-        for worker_spec in kv_cache_specs
-    ]
+    # We use per-worker projected groups to account for PP sharding and, when
+    # a platform allocation hook is registered (e.g. KVPP), per-worker layer
+    # ownership / scratch overrides.
+    allocation_hook = get_kv_cache_allocation_hook()
+    scratch_aliases_per_worker: list[dict[str, list[str]] | None] = []
+    kvpp_owners_per_worker: list[dict[str, int] | None] = []
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]] = []
+    for worker_index, worker_spec in enumerate(kv_cache_specs):
+        if allocation_hook is not None:
+            result = allocation_hook(
+                vllm_config, global_kv_cache_groups, worker_spec, worker_index
+            )
+            projected_groups_per_worker.append(result.allocation_groups)
+            scratch_aliases_per_worker.append(result.scratch_aliases)
+            kvpp_owners_per_worker.append(result.kvpp_layer_owners)
+        else:
+            projected_groups_per_worker.append(
+                _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+            )
+            scratch_aliases_per_worker.append(None)
+            kvpp_owners_per_worker.append(None)
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
@@ -2106,17 +2187,41 @@ def get_kv_cache_configs(
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
-    ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
-        kv_cache_configs.append(
-            get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
-            )
+    for worker_index, (
+        projected_groups,
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        scratch_aliases,
+        kvpp_owners,
+    ) in enumerate(
+        zip(
+            projected_groups_per_worker,
+            kv_cache_specs,
+            available_memory,
+            scratch_aliases_per_worker,
+            kvpp_owners_per_worker,
         )
+    ):
+        if kvpp_owners is None:
+            assert sum(len(group.layer_names) for group in projected_groups) == len(
+                kv_cache_spec_one_worker
+            ), "Some layers are not assigned to any group."
+        kv_cache_config = get_kv_cache_config_from_groups(
+            vllm_config, projected_groups, available_memory_one_worker
+        )
+        if scratch_aliases:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                expanded_names: list[str] = []
+                for layer_name in tensor.shared_by:
+                    expanded_names.extend(scratch_aliases.get(layer_name, [layer_name]))
+                tensor.shared_by = list(dict.fromkeys(expanded_names))
+        if kvpp_owners is not None:
+            kvpp_size = vllm_config.parallel_config.kvpp_size
+            kv_cache_config.kvpp_rank = worker_index % kvpp_size
+            kv_cache_config.kvpp_layer_owners = {
+                name: kvpp_owners[name] for name in kv_cache_spec_one_worker
+            }
+        kv_cache_configs.append(kv_cache_config)
 
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid

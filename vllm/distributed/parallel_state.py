@@ -1378,6 +1378,14 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_KVPP: GroupCoordinator | None = None
+
+
+def get_kvpp_group() -> GroupCoordinator:
+    assert _KVPP is not None, "KV layer parallel group is not initialized"
+    return _KVPP
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1716,6 +1724,7 @@ def initialize_model_parallel(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    kvpp_model_parallel_size: int | None = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1830,6 +1839,25 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="dcp",
+    )
+
+    # Build the KV layer-parallel group. Like DCP, KVPP reuses the TP ranks
+    # without expanding the world size. It is mutually exclusive with DCP.
+    global _KVPP
+    assert _KVPP is None, "KV layer parallel group is already initialized"
+    kvpp_size = kvpp_model_parallel_size or 1
+    if decode_context_model_parallel_size is not None and (
+        (decode_context_model_parallel_size or 1) > 1 and kvpp_size > 1
+    ):
+        raise ValueError("DCP and KVPP cannot be enabled at the same time.")
+    kvpp_ranks = local_all_ranks if enable_elastic_ep else all_ranks
+    group_ranks = kvpp_ranks.reshape(-1, kvpp_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
+    _KVPP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="kvpp",
     )
 
     global _PCP
@@ -1960,6 +1988,7 @@ def ensure_model_parallel_initialized(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    kvpp_model_parallel_size: int | None = 1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1977,6 +2006,7 @@ def ensure_model_parallel_initialized(
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,
+            kvpp_model_parallel_size,
         )
         return
 
@@ -1996,6 +2026,12 @@ def ensure_model_parallel_initialized(
         "prefill context parallel group already initialized, but of unexpected size: "
         f"{pcp_world_size=} vs. "
         f"{prefill_context_model_parallel_size=}"
+    )
+    kvpp_world_size = get_kvpp_group().world_size
+    kvpp_parallel_size = kvpp_model_parallel_size or 1
+    assert kvpp_world_size == kvpp_parallel_size, (
+        "KV layer parallel group already initialized, but of unexpected size: "
+        f"{kvpp_world_size=} vs. {kvpp_parallel_size=}"
     )
 
 
@@ -2056,6 +2092,11 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _KVPP
+    if _KVPP:
+        _KVPP.destroy()
+    _KVPP = None
 
     global _PCP
     if _PCP:
