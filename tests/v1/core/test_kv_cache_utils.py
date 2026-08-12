@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 import torch
 
+import vllm.v1.core.kv_cache_placement as kv_cache_placement
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -1227,14 +1228,14 @@ def test_project_kv_cache_groups_to_worker():
         KVCacheGroupSpec(["layer1", "layer2", "layer3"], spec_a),
     ]
     worker_spec = {"layer1": spec_a, "layer2": spec_a}
-    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+    projected = kv_cache_placement.project_kv_cache_groups_to_worker(
         global_groups, worker_spec
     )
     assert len(projected) == 1
     assert projected[0].layer_names == ["layer1", "layer2"]
     assert projected[0].kv_cache_spec is spec_a
 
-    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+    projected = kv_cache_placement.project_kv_cache_groups_to_worker(
         global_groups, {"layer4": spec_a}
     )
     assert len(projected) == 1
@@ -1248,7 +1249,7 @@ def test_project_kv_cache_groups_to_worker():
     global_groups_uniform = [
         KVCacheGroupSpec(["layer1", "layer2", "layer3"], uniform_spec),
     ]
-    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+    projected = kv_cache_placement.project_kv_cache_groups_to_worker(
         global_groups_uniform, {"layer1": spec_a, "layer3": spec_a}
     )
     assert len(projected) == 1
@@ -1284,6 +1285,84 @@ def test_uniform_type_spec_block_table_width_matches_layer_spec(
 
     assert layer_spec.max_num_blocks_per_req(vllm_config, 1024) == expected_width
     assert uniform_spec.max_num_blocks_per_req(vllm_config, 1024) == expected_width
+def test_kvpp_uses_contiguous_layer_bundles_and_dual_scratch():
+    layer_names = [f"model.layers.{index}.self_attn" for index in range(6)]
+    indexer_names = [f"model.layers.{index}.indexer_attn" for index in range(6)]
+    spec = new_kv_cache_spec()
+    owners = kv_cache_placement.get_kvpp_layer_owners(
+        dict.fromkeys(layer_names + indexer_names, spec), kvpp_size=2
+    )
+
+    assert [owners[name] for name in layer_names] == [0, 0, 0, 1, 1, 1]
+    assert [owners[name] for name in indexer_names] == [0, 0, 0, 1, 1, 1]
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        parallel_config=ParallelConfig(tensor_parallel_size=2, kvpp_size=2),
+    )
+    worker_specs = [dict.fromkeys(layer_names, spec) for _ in range(2)]
+    available_memory = [spec.page_size_bytes * 5 * 10] * 2
+
+    configs = get_kv_cache_configs(vllm_config, worker_specs, available_memory)
+
+    assert [config.num_blocks for config in configs] == [10, 10]
+    assert all(
+        config.kv_cache_groups[0].layer_names == layer_names for config in configs
+    )
+    expected_worker_owners = {name: owners[name] for name in layer_names}
+    assert configs[0].kvpp_layer_owners == expected_worker_owners
+    assert configs[1].kvpp_layer_owners == expected_worker_owners
+    assert [tensor.shared_by for tensor in configs[0].kv_cache_tensors] == [
+        [layer_names[0]],
+        [layer_names[1]],
+        [layer_names[2]],
+        [layer_names[3], layer_names[5]],
+        [layer_names[4]],
+    ]
+    assert [tensor.shared_by for tensor in configs[1].kv_cache_tensors] == [
+        [layer_names[0], layer_names[2]],
+        [layer_names[1]],
+        [layer_names[3]],
+        [layer_names[4]],
+        [layer_names[5]],
+    ]
+
+
+def test_kvpp_allocates_dual_scratch_per_cache_layout():
+    layer_names = [f"model.layers.{index}.self_attn" for index in range(3)]
+    indexer_names = [
+        f"model.layers.{index}.self_attn.indexer.k_cache" for index in range(3)
+    ]
+    main_spec = new_kv_cache_spec()
+    indexer_spec = new_kv_cache_spec(num_kv_heads=4)
+    specs = {
+        **dict.fromkeys(layer_names, main_spec),
+        **dict.fromkeys(indexer_names, indexer_spec),
+    }
+    group = KVCacheGroupSpec(
+        layer_names + indexer_names,
+        UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs),
+    )
+    owners = dict.fromkeys(specs, 1)
+
+    allocation_groups, scratch_aliases = (
+        kv_cache_placement.get_kvpp_allocation_groups(
+            [group], specs, owners, kvpp_rank=0
+        )
+    )
+
+    assert allocation_groups[0].layer_names == [
+        layer_names[0],
+        layer_names[1],
+        indexer_names[0],
+        indexer_names[1],
+    ]
+    assert scratch_aliases == {
+        layer_names[0]: [layer_names[0], layer_names[2]],
+        layer_names[1]: [layer_names[1]],
+        indexer_names[0]: [indexer_names[0], indexer_names[2]],
+        indexer_names[1]: [indexer_names[1]],
+    }
 
 
 def test_merge_kv_cache_spec():
