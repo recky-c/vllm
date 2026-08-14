@@ -1365,6 +1365,106 @@ def test_kvpp_allocates_dual_scratch_per_cache_layout():
     }
 
 
+def test_kvpp_identifies_mtp_cache_layers_by_model_layer_range():
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="mtp"),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_hidden_layers=64,
+                num_nextn_predict_layers=2,
+            )
+        ),
+    )
+    specs = dict.fromkeys(
+        [
+            "model.layers.0.self_attn.attn",
+            "model.layers.63.self_attn.attn",
+            "model.layers.64.mtp_block.self_attn.attn",
+            "model.layers.64.mtp_block.self_attn.attn.indexer.k_cache",
+            "model.layers.65.mtp_block.self_attn.attn",
+        ],
+        new_kv_cache_spec(),
+    )
+
+    replicated = kv_cache_utils._get_kvpp_replicated_mtp_layers(
+        config, specs
+    )
+
+    assert replicated == {
+        "model.layers.64.mtp_block.self_attn.attn",
+        "model.layers.64.mtp_block.self_attn.attn.indexer.k_cache",
+        "model.layers.65.mtp_block.self_attn.attn",
+    }
+
+
+def test_kvpp_allocates_mtp_layers_locally_without_scratch_aliases():
+    target_names = [
+        f"model.layers.{index}.self_attn.attn" for index in range(3)
+    ]
+    mtp_names = [
+        "model.layers.3.mtp_block.self_attn.attn",
+        "model.layers.3.mtp_block.self_attn.attn.indexer.k_cache",
+    ]
+    spec = new_kv_cache_spec()
+    specs = dict.fromkeys(target_names + mtp_names, spec)
+    group = KVCacheGroupSpec(target_names + mtp_names, spec)
+    owners = dict.fromkeys(target_names, 1)
+
+    allocation_groups, scratch_aliases = (
+        kv_cache_placement.get_kvpp_allocation_groups(
+            [group], specs, owners, kvpp_rank=0
+        )
+    )
+
+    assert allocation_groups[0].layer_names == [
+        target_names[0],
+        target_names[1],
+        *mtp_names,
+    ]
+    assert scratch_aliases == {
+        target_names[0]: [target_names[0], target_names[2]],
+        target_names[1]: [target_names[1]],
+    }
+    assert not set(mtp_names).intersection(scratch_aliases)
+
+
+def test_kvpp_config_excludes_replicated_mtp_layers_from_owners(monkeypatch):
+    target_names = [
+        f"model.layers.{index}.self_attn.attn" for index in range(4)
+    ]
+    mtp_name = "model.layers.4.mtp_block.self_attn.attn"
+    spec = new_kv_cache_spec()
+    worker_specs = [
+        dict.fromkeys([*target_names, mtp_name], spec) for _ in range(2)
+    ]
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2, kvpp_size=2
+        ),
+    )
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_get_kvpp_replicated_mtp_layers",
+        lambda *_: {mtp_name},
+    )
+
+    configs = get_kv_cache_configs(
+        config,
+        worker_specs,
+        [spec.page_size_bytes * 6 * 10] * 2,
+    )
+
+    for worker_config in configs:
+        assert worker_config.kvpp_layer_owners is not None
+        assert set(worker_config.kvpp_layer_owners) == set(target_names)
+        assert mtp_name not in worker_config.kvpp_layer_owners
+        assert any(
+            mtp_name in tensor.shared_by
+            for tensor in worker_config.kv_cache_tensors
+        )
+
+
 def test_merge_kv_cache_spec():
     same_layer_specs = [
         new_kv_cache_spec(num_kv_heads=32),

@@ -68,6 +68,17 @@ def get_kvpp_layer_owners(
     return owners
 
 
+def get_layers_in_index_range(
+    kv_cache_specs: dict[str, KVCacheSpec], start: int, end: int
+) -> set[str]:
+    """Return all KV-cache entries belonging to model layers in [start, end)."""
+    return {
+        layer_name
+        for layer_name in kv_cache_specs
+        if start <= extract_layer_index(layer_name) < end
+    }
+
+
 def get_kvpp_allocation_groups(
     logical_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
@@ -80,9 +91,17 @@ def get_kvpp_allocation_groups(
 
     for group in logical_groups:
         local_names = [name for name in group.layer_names if name in worker_spec]
-        owned_names = [name for name in local_names if owners[name] == kvpp_rank]
-        non_owned_names = [name for name in local_names if owners[name] != kvpp_rank]
-        allocation_names = list(owned_names)
+        managed_names = [name for name in local_names if name in owners]
+        replicated_names = [name for name in local_names if name not in owners]
+        owned_names = [name for name in managed_names if owners[name] == kvpp_rank]
+        non_owned_names = [
+            name for name in managed_names if owners[name] != kvpp_rank
+        ]
+        allocation_names = [
+            name
+            for name in local_names
+            if name in replicated_names or name in owned_names
+        ]
         scratch_layout_groups: list[list[str]] = []
         for name in non_owned_names:
             for layout_names in scratch_layout_groups:

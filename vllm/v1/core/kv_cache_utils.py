@@ -2051,6 +2051,34 @@ def _auto_fit_max_model_len(
         )
 
 
+def _get_kvpp_replicated_mtp_layers(
+    vllm_config: VllmConfig,
+    kv_cache_specs: dict[str, KVCacheSpec],
+) -> set[str]:
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.method != "mtp":
+        return set()
+
+    hf_config = vllm_config.model_config.hf_config
+    mtp_start = getattr(hf_config, "num_hidden_layers", None)
+    num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", None)
+    if mtp_start is None or not num_mtp_layers:
+        raise ValueError(
+            "KVPP with MTP requires num_hidden_layers and a positive "
+            "num_nextn_predict_layers in the model config."
+        )
+
+    mtp_end = mtp_start + num_mtp_layers
+    replicated_layers = kv_cache_placement.get_layers_in_index_range(
+        kv_cache_specs, mtp_start, mtp_end
+    )
+    if not replicated_layers:
+        raise ValueError(
+            "KVPP could not identify any MTP KV-cache layers to replicate."
+        )
+    return replicated_layers
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2111,8 +2139,23 @@ def get_kv_cache_configs(
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
 
     kvpp_size = vllm_config.parallel_config.kvpp_size
+    replicated_mtp_layers = (
+        _get_kvpp_replicated_mtp_layers(
+            vllm_config, merged_kv_cache_specs
+        )
+        if kvpp_size > 1
+        else set()
+    )
+
+    kvpp_managed_specs = {
+        layer_name: spec
+        for layer_name, spec in merged_kv_cache_specs.items()
+        if layer_name not in replicated_mtp_layers
+    }
     kvpp_owners = (
-        kv_cache_placement.get_kvpp_layer_owners(merged_kv_cache_specs, kvpp_size)
+        kv_cache_placement.get_kvpp_layer_owners(
+            kvpp_managed_specs, kvpp_size
+        )
         if kvpp_size > 1
         else None
     )
@@ -2208,7 +2251,9 @@ def get_kv_cache_configs(
             )
             kv_cache_config.kvpp_rank = worker_index % kvpp_size
             kv_cache_config.kvpp_layer_owners = {
-                name: kvpp_owners[name] for name in kv_cache_spec_one_worker
+                name: kvpp_owners[name]
+                for name in kv_cache_spec_one_worker
+                if name in kvpp_owners
             }
         else:
             assert sum(len(group.layer_names) for group in projected_groups) == len(
