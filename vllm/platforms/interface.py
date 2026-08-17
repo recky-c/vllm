@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheSpec,
+    )
 else:
     FlexibleArgumentParser = object
 
@@ -945,6 +950,33 @@ class Platform:
         Register custom KVCacheSpec class on current platform.
         """
         pass
+
+    @classmethod
+    def get_kv_cache_groups_for_worker(
+        cls,
+        vllm_config: "VllmConfig",
+        global_kv_cache_groups: list["KVCacheGroupSpec"],
+        worker_kv_cache_spec: dict[str, "KVCacheSpec"],
+        worker_index: int,
+    ) -> list["KVCacheGroupSpec"] | None:
+        """Optionally customize the physical KV-cache groups for a worker.
+
+        Returning ``None`` keeps the default per-worker projection. Out-of-tree
+        platforms may return a reduced physical allocation while preserving the
+        logical cache configuration in :meth:`finalize_kv_cache_config`.
+        """
+        return None
+
+    @classmethod
+    def finalize_kv_cache_config(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_config: "KVCacheConfig",
+        global_kv_cache_groups: list["KVCacheGroupSpec"],
+        worker_kv_cache_spec: dict[str, "KVCacheSpec"],
+        worker_index: int,
+    ) -> None:
+        """Finalize a worker KV-cache config after physical allocation."""
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
