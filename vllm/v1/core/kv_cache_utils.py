@@ -15,6 +15,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
@@ -2054,20 +2055,7 @@ def _project_kv_cache_groups_to_worker(
     global_kv_cache_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
-    """
-    Projects global KV cache groups onto a single worker's assigned layers.
-
-    In pipeline parallelism, each worker only owns a subset of layers. This
-    function filters the global groups to include only layers present on the
-    given worker, adjusting UniformTypeKVCacheSpecs accordingly.
-
-    Args:
-        global_kv_cache_groups: The global KV cache groups for the whole model.
-        worker_spec: The KV cache spec of each layer on this worker.
-
-    Returns:
-        The projected KV cache groups containing only this worker's layers.
-    """
+    """Project global logical groups onto one worker's assigned layers."""
     projected_groups: list[KVCacheGroupSpec] = []
     for group in global_kv_cache_groups:
         worker_layer_names = [
@@ -2109,8 +2097,8 @@ def get_kv_cache_configs(
        the whole model.
     2. Generate the KV cache groups based on the layer ratio of the whole model.
        This also handles spec unification for hybrid models.
-    3. Handle auto-fit max_model_len and memory checks using per-worker
-       projected groups to account for PP sharding.
+    3. Project each worker to its assigned layers. Platforms may override this
+       physical projection for device-specific cache placement.
     4. Generate the KV cache configs for each worker based on the KV cache
        grouping strategy. (This is reasonable because the layer ratio of
        different PP stages are similar.)
@@ -2152,10 +2140,21 @@ def get_kv_cache_configs(
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
-    projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
-        for worker_spec in kv_cache_specs
-    ]
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]] = []
+    custom_placement_per_worker: list[bool] = []
+    for worker_index, worker_spec in enumerate(kv_cache_specs):
+        projected_groups = current_platform.get_kv_cache_groups_for_worker(
+            vllm_config,
+            global_kv_cache_groups,
+            worker_spec,
+            worker_index,
+        )
+        custom_placement_per_worker.append(projected_groups is not None)
+        if projected_groups is None:
+            projected_groups = _project_kv_cache_groups_to_worker(
+                global_kv_cache_groups, worker_spec
+            )
+        projected_groups_per_worker.append(projected_groups)
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
@@ -2196,17 +2195,34 @@ def get_kv_cache_configs(
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
-    ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
-        kv_cache_configs.append(
-            get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
-            )
+    for worker_index, (
+        projected_groups,
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        custom_placement,
+    ) in enumerate(
+        zip(
+            projected_groups_per_worker,
+            kv_cache_specs,
+            available_memory,
+            custom_placement_per_worker,
         )
+    ):
+        kv_cache_config = get_kv_cache_config_from_groups(
+            vllm_config, projected_groups, available_memory_one_worker
+        )
+        current_platform.finalize_kv_cache_config(
+            vllm_config,
+            kv_cache_config,
+            global_kv_cache_groups,
+            kv_cache_spec_one_worker,
+            worker_index,
+        )
+        if not custom_placement:
+            assert sum(len(group.layer_names) for group in projected_groups) == len(
+                kv_cache_spec_one_worker
+            ), "Some layers are not assigned to any group."
+        kv_cache_configs.append(kv_cache_config)
 
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
