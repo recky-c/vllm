@@ -478,7 +478,6 @@ class EngineArgs:
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
-    kvpp_size: int = 1
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
@@ -1047,12 +1046,6 @@ class EngineArgs:
             "--decode-context-parallel-size",
             "-dcp",
             **parallel_kwargs["decode_context_parallel_size"],
-        )
-        parallel_group.add_argument(
-            "--kvpp-size",
-            type=int,
-            default=1,
-            help="Compatibility option forwarded to additional_config.kvpp_size.",
         )
         parallel_group.add_argument(
             "--dcp-comm-backend",
@@ -2467,14 +2460,6 @@ class EngineArgs:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
         if self.kda_prefill_backend is not None:
             self.additional_config["kda_prefill_backend"] = self.kda_prefill_backend
-        configured_kvpp_size = self.additional_config.get("kvpp_size")
-        if self.kvpp_size != 1:
-            if configured_kvpp_size not in (None, self.kvpp_size):
-                raise ValueError(
-                    "--kvpp-size conflicts with additional_config.kvpp_size: "
-                    f"{self.kvpp_size} != {configured_kvpp_size}."
-                )
-            self.additional_config["kvpp_size"] = self.kvpp_size
 
         config = VllmConfig(
             model_config=model_config,
